@@ -1,0 +1,290 @@
+#!/bin/bash
+#
+# restic-run - run restic commands in pre-configured environments.
+#
+# Please see README.md in this repository for usage documentation.
+#
+# MIT License
+#
+# Copyright (c) 2021 Jason White
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+### usage: restic-run [-i] [-l] [-m | -M] {reponame} {restic_cmd} [restic_args ...]
+### 
+###  -i - install restic-run config file framework. Typically done when first 
+###       setting up `restic-run`.
+###  -l - log to ${LOGDIR}/${reponame}
+###  -m - mail log if restic exits with a non-zero return code.
+###  -M - always mail output, regardless of restic return code.
+### 
+###  {reponame}    - name of directory in ~/.config/restic/ containing config 
+###                  files for a particular repository.
+###  {restic_cmd}  - restic command to run such as 'backup' or 'purge'.
+###  {restic_args} - passed, verbatim, to 'restic' after {restic_cmd}. [OPTIONAL]
+
+function main
+{
+	GLOBAL_ENV="${HOME}/.config/restic/glob_env.sh"
+	[ -r "$GLOBAL_ENV" ] && source $GLOBAL_ENV
+
+	while getopts ":hlmMi" arg; do
+		case "$arg" in
+			h)
+				usage
+				;;
+			l)
+				if [ -z "${LOGDIR}" ]; then
+					perror "Logging enabled, but LOGDIR is empty. export LOGDIR in ${GLOBAL_ENV}."
+				fi
+				echo Logging to $LOGDIR
+				export opt_l=1
+				;;
+			m)
+				if [ -z "${MAILTO}" ]; then
+					perror "Email requested, but MAILTO is empty. export MAILTO in ${GLOBAL_ENV}."
+				fi
+				echo Log will be mailed to $MAILTO on error.
+				export opt_m=1
+				;;
+			M)
+				if [ -z "${MAILTO}" ]; then
+					perror "Email requested, but MAILTO is empty. export MAILTO in ${GLOBAL_ENV}."
+				fi
+				echo Log will be mailed to ${MAILTO}.
+				export opt_M=1
+				;;
+			i)
+				initialize_sample_config
+				exit
+				;;
+			:)
+				perror "-${OPTARG} requires an argument."
+				;;
+			?)
+				echo "Invalid arg -${OPTARG}."
+				usage
+		esac
+	done
+	shift $((OPTIND - 1))
+
+	# Ensure that a repo name and restic command arg was given.
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		usage
+		exit 1
+	fi
+
+	export REPONAME=$1; shift
+	export RESTIC_CMD=$1; shift
+	export REPOCONFDIR="${HOME}/.config/restic/${REPONAME}"
+	[ ! -z "$opt_l" ] && export LOGFILE="${LOGDIR}/${REPONAME}"
+	export RUNLOG=/tmp/restic-${REPONAME}_${RESTIC_CMD}-$(date +"%F_%T")
+
+	export LOG=
+	if [ ! -z "$opt_l" -o ! -z "$opt_m" -o ! -z "$opt_M" ]; then
+		export LOG=1
+	fi
+
+	(
+		[ -z "$LOG" ] || echo "-----[ BEGIN restic-run environment config ]-----"
+		init_environment
+		[ -z "$LOG" ] || echo "REPONAME(cmdline)=${REPONAME}"
+		echo RESTIC_REPOSITORY=${RESTIC_REPOSITORY}
+		[ -z "$LOG" ] || echo REPOCONFDIR=${REPOCONFDIR}
+		[ -z "$LOG" ] || echo RESTIC_CMD=${RESTIC_CMD}
+		[ -z "$LOG" ] || echo LOGFILE=${LOGFILE}
+		[ -z "$LOG" ] || echo args="${args[@]}"
+		[ -z "$LOG" ] || echo cmdline_args="$@"
+		[ -z "$LOG" ] || echo "-----[ BEGIN restic ${RESTIC_CMD} ]-----"
+		cmd="restic $RESTIC_CMD "${args[@]}" "$@""
+		echo ">>>Running: ${cmd}"
+		$cmd
+		rc=$?
+		[ -z "$LOG" ] || echo "restic $RESTIC_CMD done; rc=${rc}"
+		[ -z "$LOG" ] || echo "-----[ END restic ${RESTIC_CMD} ]-----"
+
+		exit $rc
+	) 2>&1 | while IFS= read -r line;
+	do
+		echo "${line}"
+		echo "$(date +"%F %T %Z") [${REPONAME}::${RESTIC_CMD}] ${line}" | tee -a ${LOGFILE} ${RUNLOG} >/dev/null
+	done
+	RESTIC_RC=${PIPESTATUS[0]}
+
+	if [ $RESTIC_RC != 0 -a ! -z "$opt_m" ] || [ ! -z "$opt_M" ]; then
+		if [ $RESTIC_RC != 0 ]; then ERRSTR=' error'; fi
+		SUBJ="$(printf "restic %s %s%s log (%s)" \
+			${REPONAME} \
+			${RESTIC_CMD} \
+			"${ERRSTR}" \
+			$(hostname | sed -E 's/\.[^\.]+\.[^\.]+$//')
+		)"
+		echo "Mailing logfile to ${MAILTO}."
+		cat ${RUNLOG} | mail -s "${SUBJ}" $MAILTO
+	fi
+} # main
+
+#
+# Install config file framework, if non-existant.
+#
+function initialize_sample_config
+{
+	mkdir -p ~/.config/restic || exit 1
+	cd ~/.config/restic || exit 1
+	if [ ! -e glob_env.sh ]; then
+		cat > glob_env.sh <<-_EOF_
+		#
+		# glob_env.sh - Global environment file for restic-run.
+		#
+		# This file is always read regardless of which restic command is
+		# specified. These variables can be overridden in the
+		# repo-specific env.sh file.
+		#
+
+		# Recipient for emailed logs if '-m' or '-M' is specified.
+		#export MAILTO=
+
+		# Directory to write restic logs if '-l' is specified.
+		#export LOGDIR=/var/log/restic
+_EOF_
+	else
+		echo "Not overwriting existing `pwd`/glob_env.sh"
+	fi
+
+	if [ -e sample ]; then
+		echo "Not overwriting existing directory `pwd`/sample"
+		exit 1
+	fi
+	mkdir sample || exit 1
+	cd sample || exit 1
+
+	cat > backup_args.sh <<-_EOF_
+	# This file is sourced by restic-run if the {restic_cmd} is 'backup'.
+	# Append arguments to pass to 'restic backup' to the 'args' array.
+	#
+	args+=("--verbose" "--one-file-system" "--exclude-caches=true")
+	args+=("--cleanup-cache" "--exclude-if-present" ".nobackup")
+	args+=("--exclude-file" "\${EXCLUDES}")
+	args+=("--files-from" "\${INCLUDES}")
+_EOF_
+
+	cat > env.sh <<-_EOF_
+	# This file is sourced by restic-run and typically contains
+	# restic-specific environment variables. See the following URL for a
+	# comprehensive list:
+	# https://restic.readthedocs.io/en/latest/040_backup.html#environment-variables
+	#
+	#export RESTIC_REPOSITORY=
+	#export RESTIC_PASSWORD=
+_EOF_
+
+	cat > stats_args.sh <<-_EOF_
+	# This file is sourced by restic-run if the {restic_cmd} is 'stats'.
+	# Append arguments to pass to 'restic stats' to the args array.
+	args+=("--mode=raw-data")
+_EOF_
+
+}
+
+#
+# init_environment - source configuration files.
+#
+function init_environment
+{
+	if [ ! -e "${REPOCONFDIR}" ]; then
+		perror "${REPOCONFDIR} does not exist."
+	fi
+
+	#
+	# Source env.sh
+	#
+	f="${REPOCONFDIR}/env.sh"
+	if [ -r "${f}" ]; then
+		[ -z "$LOG" ] || echo Sourcing $f >&2
+	    source $f
+	fi
+
+	#
+	# Define RESTIC_PASSWORD_FILE.
+	#
+	f="${REPOCONFDIR}/passwd"
+	if [ -s "$f" ]; then
+		export RESTIC_PASSWORD_FILE="${f}"
+		[ -z "$LOG" ] || echo RESTIC_PASSWORD_FILE=${RESTIC_PASSWORD_FILE}
+	fi
+
+	#
+	# Define EXCLUDES.
+	#
+	f="${REPOCONFDIR}/excludes"
+	if [ -s "$f" ]; then
+		export EXCLUDES="$f"
+	fi
+
+	#
+	# Define IEXCLUDES.
+	#
+	f="${REPOCONFDIR}/iexcludes"
+	if [ -s "$f" ]; then
+		export IEXCLUDES="${f}"
+	fi
+
+	#
+	# Define INCLUDES.
+	#
+	f="${REPOCONFDIR}/includes"
+	if [ -s "$f" ]; then
+		export INCLUDES="${f}"
+	fi
+
+	#
+	# Read command-specific arguments.
+	#
+	f="${REPOCONFDIR}/${RESTIC_CMD}_args.sh"
+	if [ -r "${f}" ]; then
+		[ -z "$LOG" ] || echo Sourcing $f >&2
+		source $f
+	fi
+}
+
+function cleanup
+{
+	rm -f ${RUNLOG}
+}
+
+#
+# perror - print message to STDERR and exit(1).
+#
+function perror
+{
+	printf "error: %s\n" "$@" >&2
+	exit 1
+}
+
+function usage
+{
+	sed -n 's/^### //p' $0
+	exit 1
+}
+
+trap cleanup EXIT HUP INT
+
+main "$@"
+
+exit
