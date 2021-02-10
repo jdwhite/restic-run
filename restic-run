@@ -53,6 +53,9 @@ function main
 				if [ -z "${LOGDIR}" ]; then
 					perror "Logging enabled, but LOGDIR is empty. export LOGDIR in ${GLOBAL_ENV}."
 				fi
+				if [ ! -d "${LOGDIR}" ]; then
+					mkdir -p $LOGDIR
+				fi
 				echo Logging to $LOGDIR
 				export opt_l=1
 				;;
